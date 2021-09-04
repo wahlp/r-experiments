@@ -1,0 +1,570 @@
+---
+title: "TF2 Server Analysis"
+output: 
+    html_document:
+        css: dane.css
+        theme: spacelab
+        includes:
+            in_header: myheader.html
+---
+
+```{r setup, warning = FALSE, message = FALSE, echo = FALSE}
+library(ggplot2)
+theme_set(theme_minimal()) # ggplot2 theme
+library(plotly)
+library(knitr)
+library(lubridate)
+
+library(jsonlite)
+library(dotenv)
+library(mongolite)
+
+load_dot_env(file = ".env")
+
+con <- mongo(
+    db = "tf2",
+    collection = "snapshots",
+    url = Sys.getenv("MONGODB_CONN_STRING_SNAPSHOTS")
+)
+
+# calc unix timestamp for 3 days ago
+time_target <- as.numeric(as.POSIXct(Sys.time()) - 3*24*60*60)
+
+# get data from mongodb
+data <- con$find(
+    paste0('{ "info.server_name": {"$regex": "Uncletopia", "$options": "i"}, "timestamp": {"$gte": ',time_target,'} }'),
+    '{ "playerCount": { "$size": "$players" }, "timestamp": 1, "_id": 0 }'
+)
+
+# function to convert timestamp to date type
+convertTimestamp <- function(ts){
+    date <- as.POSIXct(ts, origin = "1970-01-01")
+    return(date)
+}
+
+tsf <- "%d %b, %I:%M:%S %p"
+lineplot_first_ts <- data[1,]$timestamp %>% convertTimestamp() %>% format(tsf)
+lineplot_last_ts <- data[nrow(data),]$timestamp %>% convertTimestamp() %>% format(tsf)
+```
+
+Based on snapshots of the servers' data taken at 3 minute intervals (or less, if I messed up)\
+[Contact me](https://www.youtube.com/watch?v=dQw4w9WgXcQ)\
+\
+
+---
+
+## Server Analysis
+
+**First data point**: `r lineplot_first_ts`\
+**Last data point**: `r lineplot_last_ts`
+
+### Combined
+
+Most active hours ~ 10AM - 1AM\
+Least active hours ~ 4AM - 8AM\
+
+Dips in the plot are caused by missing data points - a server may not respond when queried for data.\
+This causes the player count at that point in time to not include an entire server's worth of players.\
+
+**Controls**\
+<i>
+    Hover to see the raw data (including full timestamp)\
+    Box select to zoom
+</i>
+
+```{r plotting, fig.width=12, fig.height=6, echo = FALSE}
+# group by timestamp
+df <- aggregate(
+    data$playerCount,
+    by = list(Category = data$timestamp),
+    FUN = sum
+)
+
+names(df)[names(df) == 'x'] <- 'count'
+names(df)[names(df) == 'Category'] <- 'unixTS'
+
+# # convert timestamp to date type
+# convertTimestamp <- function(ts){
+#     date <- as.POSIXct(ts, origin = "1970-01-01")
+#     return(date)
+# }
+
+df$timestamp <- convertTimestamp(df$unixTS)
+
+# setting up for ggplot rectangles
+v <- df$timestamp %>%
+    weekdays()
+
+isWeekend <- function(weekdayStr) {
+    if (weekdayStr %in% c("Saturday", "Sunday")) {
+        return(1)
+    }
+    else {
+        return(0)
+    }
+}
+
+# # https://stackoverflow.com/questions/32543176/highlight-areas-within-certain-x-range-in-ggplot2
+# # create rectangles to highlight in ggplot
+# v <- sapply(v, isWeekend)
+
+# ## Get the start and end points for highlighted regions
+# inds <- diff(c(0, v))
+# start <- df$timestamp[inds == 1]
+# end <- df$timestamp[inds == -1]
+# if (length(start) > length(end)) end <- c(end, tail(df$timestamp, 1))
+
+# ## highlight region data
+# rects <- data.frame(start=start, end=end, group=seq_along(start))
+
+# finally creating the plot
+g <- ggplot(
+    df,
+    aes(
+        x = timestamp,
+        y = count
+    )
+) +
+    scale_x_datetime(
+        breaks = "1 day",
+        date_labels = "%d %b",
+    ) +
+    # geom_rect(data = rects,
+    #     inherit.aes = FALSE,
+    #     aes(
+    #         xmin = start,
+    #         xmax = end,
+    #         ymin = min(df$count),
+    #         ymax = max(df$count),
+    #         group = group
+    #     ),
+    #     color = "transparent",
+    #     fill = "orange", alpha = 0.2
+    # ) +
+    geom_line() +
+    labs(
+        # title = "Concurrent Players in TF2 Casual Servers (Singapore)",
+        x = "Time (GMT +8)",
+        y = "Player Count",
+    )
+
+# display plot and disable hover info for rects layer
+ggplotly(g)# %>%
+    # style(hoverinfo = "none", traces = 1)
+```
+
+### Separate
+
+Each server has a slightly different set of operating hours\
+There are no sharp drops like in the overall line plot because I've queried the database for the individual server data points, rather than using query language to simplify the data beforehand
+
+**Controls**\
+<i>
+    Click on the red/blue labels on the right to toggle each line<br>
+    Hover to see the raw data (including full timestamp)<br>
+    Box select to zoom
+</i>
+```{r mongo-aggregation, echo = FALSE}
+    df2 <- con$aggregate(paste0('[
+        {
+            "$match": {
+                "info.server_name": { "$regex": "Uncletopia", "$options": "i"},
+                "timestamp": {"$gte": ',time_target,'}
+            }
+        }, {
+            "$addFields": {
+                "server": {
+                    "$switch": {
+                        "branches": [
+                            {
+                                "case": {
+                                    "$regexMatch": {
+                                        "input": "$info.server_name", 
+                                        "regex": { "$regex": "1", "$options": "i"}
+                                    }
+                                }, 
+                                "then": "server_1"
+                            }, {
+                                "case": {
+                                    "$regexMatch": {
+                                        "input": "$info.server_name", 
+                                        "regex": { "$regex": "2", "$options": "i"}
+                                    }
+                                }, 
+                                "then": "server_2"
+                            }
+                        ], 
+                        "default": "others"
+                    }
+                }, 
+                "count": {
+                    "$size": "$players"
+                }
+            }
+        }, {
+            "$group": {
+                "_id": {
+                    "timestamp": "$timestamp", 
+                    "server": "$server"
+                }, 
+                "count": {
+                    "$sum": "$count"
+                }
+            }
+        }, {
+            "$group": {
+                "_id": "$_id.timestamp", 
+                "server": {
+                    "$push": {
+                        "k": "$_id.server", 
+                        "v": "$count"
+                    }
+                }
+            }
+        }, {
+            "$project": {
+                "timestamp": "$_id", 
+                "server": {
+                    "$arrayToObject": "$server"
+                }, 
+                "_id": 0
+            }
+        }, {
+            "$project": {
+                "timestamp": 1, 
+                "server_1": "$server.server_1", 
+                "server_2": "$server.server_2"
+            }
+        }, {
+            "$sort": {
+                "timestamp": 1
+            }
+        }
+    ]'))
+
+    df2$timestamp <- convertTimestamp(df2$timestamp)
+
+    # # convert NA to 0
+    # df2[is.na(df2)] <- 0
+```
+```{r map-line-chart, fig.width=12, fig.height=6, echo = FALSE}
+    df2 <- df2 %>%
+        tidyr::gather(server_number, playerCount, -timestamp)
+
+    g2 <- ggplot(
+        df2,
+        aes(
+            x = timestamp,
+            y = playerCount,
+            color = server_number,
+            group = server_number
+        )
+    ) +
+    scale_x_datetime(
+        breaks = "1 day",
+        date_labels = "%d %b",
+    ) +
+    # geom_rect(data = rects,
+    #     inherit.aes = FALSE,
+    #     aes(
+    #         xmin = start,
+    #         xmax = end,
+    #         ymin = min(df2$playerCount),
+    #         ymax = max(df2$playerCount),
+    #         group = group
+    #     ),
+    #     color = "transparent",
+    #     fill = "orange", alpha = 0.2
+    # ) +
+    geom_line() +
+    labs(
+        # title = "Concurrent Players in TF2 Casual Servers (Singapore)",
+        x = "Time (GMT +8)",
+        y = "Player Count",
+    )
+
+# display plot and disable hover info for rects layer
+ggplotly(g2) #%>%
+    #style(hoverinfo = "none", traces = 1)
+```
+```{r echo=FALSE}
+
+stats_first_ts <- data[1,]$timestamp %>% convertTimestamp() %>% format(tsf)
+stats_last_ts <- data[1,]$timestamp %>% convertTimestamp() %>% format(tsf)
+```
+
+```{r maps, echo = FALSE}
+    df3 <- con$aggregate('[
+        {
+            "$match": {
+                "info.server_name": { "$regex": "Uncletopia", "$options": "i"}
+            }
+        }, {
+            "$group": {
+                "_id": "$info.map_name", 
+                "count": {
+                    "$sum": 1
+                }
+            }
+        }, {
+            "$project": {
+                "map_name": "$_id",
+                "count": 1,
+                "_id": 0
+            }
+        }
+    ]')
+    # counts the number of instances of each distinct value in info.map_name
+    # ie. rough estimate for map playtime
+
+    get_map_type <- function(map_name){
+        t <- strsplit(map_name, "_", fixed = TRUE)
+        first <- t[[1]][1]
+        return(first)
+    }
+
+    df3$map_type <- df3$map_name %>% sapply(get_map_type)
+    
+    df3_1 = con$find('{"info.server_name": {"$regex": "Uncletopia", "$options": "i"}}', limit = 1)
+    stats_first_ts <- df3_1[1,]$timestamp %>% convertTimestamp() %>% format(tsf)
+    df3_2 = con$find('{"info.server_name": {"$regex": "Uncletopia", "$options": "i"}}', sort = '{"timestamp": -1}', limit = 1)
+    stats_last_ts <- df3_2[1,]$timestamp %>% convertTimestamp() %>% format(tsf)
+```
+---
+
+## Stats
+**First data point**: `r stats_first_ts`\
+**Last data point**: `r stats_last_ts`
+
+### Maps Played
+
+Of course badwater and upward are the most popular.
+```{r map-plot, fig.width=8, fig.height=8, fig.align="center", echo = FALSE}
+    # Barplot, sorted by count
+    ggplot(df3,
+        aes(
+            x = reorder(map_name, count),
+            y = count,
+            fill = map_type
+            )
+        ) +
+        geom_bar(stat = "identity") +
+        # scale_fill_manual(
+        #     "legend",
+        #     values = c(
+        #         "cp" = "#56B4E9",
+        #         "ctf" = "#0072B2",
+        #         "koth" = "#009E73",
+        #         "pl" = "#E69F00",
+        #         "plr" = "#F0E442",
+        #         "rd" = "#D55E00",
+        #         "tc" = "#CC79A7"
+        #     )
+        #     # https://www.datanovia.com/en/blog/ggplot-colors-best-tricks-you-will-love/
+        # ) +
+        geom_text(aes(label = count), color = "white", hjust = 1.1, vjust = 0.35) +
+        coord_flip() +
+        labs(
+            x = "Map",
+            y = "Snapshots Seen",
+        )
+
+```
+
+Possible improvement to this analysis would be to instead use a value like 
+$$snapshotCount * playerCount$$
+to more accurately gauge the popularity of each map by considering how many people are actually playing it.
+\
+However this seems redundant as the player count is almost always maxed out, so it would be more like
+$$snapshotCount * 24$$
+which is kinda useless since there's no variation
+\
+
+### Individual Player Analysis
+
+We can count the playtime of each player.\
+This assumes every unique name is a separate person. Obviously, this is flawed but whatever.\
+Values are formatted as hours:minutes:seconds
+```{r echo = FALSE}
+    df4 <- con$aggregate('[
+        {
+            "$match": {
+                "info.server_name": { "$regex": "Uncletopia", "$options": "i"}
+            }
+        }, {
+            "$project": {
+                "server_name": "$info.server_name",
+                "timestamp": 1,
+                "players": 1
+            }
+        }, {
+            "$sort": {
+                "timestamp": 1
+            }
+        }
+    ]')
+
+    # filter empty names
+    filter_empty <- function(players){
+        players <- players[players$name != '',]
+        return(players)
+    }
+    df4$players <- df4$players %>% lapply(filter_empty)
+```
+
+```{r playtime-calc, warning = FALSE, message = FALSE, echo = FALSE}
+    # filter to separate server 1 and server 2
+    snaps <- list(
+        filter(df4, server_name == "Uncletopia | Singapore | 1"),
+        filter(df4, server_name == "Uncletopia | Singapore | 2")
+    )
+    # snaps <- filter(df4, server_name == "Uncletopia | Singapore | 2")
+    
+    # iterate forwards in time and keep track of each name
+    count_playtime <- function(server_snaps){
+        all_time_durations <- hash::hash()
+        players_prev <- c()
+
+        for (s in 1:nrow(server_snaps)){
+        #by(server_snaps, seq_len(nrow(server_snaps)), function(s){
+            # compare all names in this snap to the previous one
+            playerObj <- server_snaps[s,]$players#[[1]]
+            players_now <- playerObj[[1]]
+
+            if (!is.null(players_prev)){
+                lost_names <- compare_players(players_now$name, players_prev$name)
+                # if a name disappears after an iteration,
+                for (left_player_name in lost_names){
+                    # push last seen player.duration to an array
+                    player_row <- players_prev[players_prev$name == left_player_name,]
+    
+                    # if key does not exist in the stupid af php style list then make one
+                    if (!rlang::has_name(all_time_durations, player_row$name)) {
+                        all_time_durations[player_row$name] <- c(player_row$duration)
+                    } else {
+                        # append the duration value to the vector
+                        all_time_durations[player_row$name] <- append(
+                            # all_time_durations[player_row$name],
+                            hash::values(all_time_durations, keys=player_row$name),
+                            player_row$duration
+                        )
+                    }
+                    
+                }
+            }
+
+            # remember all player names for next loop iteration
+            players_prev <- players_now
+        }
+        
+        player_durations <- 
+        return(all_time_durations)
+    }
+
+    compare_players <- function (list_now, list_prev) {
+        setdiff(list_prev, list_now) %>%
+        return()
+    }
+
+    # # do this for both servers
+    # for (server in snaps){
+    #     stuff <- count_playtime(server)
+    # }
+    
+    result1 <- count_playtime(snaps[[1]]) %>% as.list(all.names = TRUE) %>% lapply(sum)
+    result2 <- count_playtime(snaps[[2]]) %>% as.list(all.names = TRUE) %>% lapply(sum)
+    
+    # flatten / https://stackoverflow.com/a/9519964
+    appendList <- function (x, val) 
+    {
+        stopifnot(is.list(x), is.list(val))
+        xnames <- names(x)
+        for (v in names(val)) {
+            x[[v]] <- if (v %in% xnames && is.list(x[[v]]) && is.list(val[[v]])) 
+                appendList(x[[v]], val[[v]])
+            else c(x[[v]], val[[v]])
+        }
+        x
+    }
+    final_result <- appendList(result1, result2) %>% lapply(sum)
+    final_df <- stack(final_result)
+    colnames(final_df) <- c('playtime', 'name')
+    
+    # write.csv(final_df, 'playtimes.csv', row.names = FALSE)
+```
+
+```{r playtime-table, warning = FALSE, echo = FALSE}
+    # playtimes <- read.csv('playtimes.csv')
+    playtimes <- final_df
+
+    # sort by playtime
+    playtimes <- playtimes[order(-playtimes$playtime),]
+    # fix unicode names
+    fix_unicode_names <- function(name){
+        name <- paste(stringi::stri_unescape_unicode(gsub("<U\\+(....)>", "\\\\u\\1", name)))
+        return(name)
+    }
+    playtimes$name <- lapply(playtimes$name, fix_unicode_names)
+    # set column to display as position in table
+    playtimes$position <- 1:nrow(playtimes)
+    # clear index
+    rownames(playtimes) <- NULL
+    
+    # convert seconds to nice string
+    playtimes$timeString <- playtimes$playtime %>% lapply(function(x){
+        x <- x %>%
+            round() %>% 
+            lubridate::seconds_to_period()
+        sprintf('%02d:%02d:%02d', x@hour + x@day * 24, minute(x), second(x))
+        # might bug out if x ever gets to have a year component
+    })
+    
+    # # unicode fixes
+    # # only works on raw html table    
+    # replace_unicode_format <- function(unicode_str){
+    #     # actual str is <U+0223>
+    #     # take &lt;U+0223&gt;
+    #     # return &#x0223;
+    #     html_unicode <- paste("&#x", substr(unicode_str, 7, 10), ";", sep = "")
+    #     return(html_unicode)
+    # }
+    # 
+    # fix_unicode <- function(html_string){
+    #     stringr::str_replace_all(
+    #         html_string,
+    #         "&lt;U\\+([0-9A-F]{4,8})&gt;",
+    #         replace_unicode_format
+    #     )
+    # }
+
+    # # print a nice table
+    # tableLimit <- 50
+    # kable(
+    #     playtimes[1:tableLimit,c('position', 'name', 'timeString')], 
+    #     col.names = c('#', 'Name', 'Playtime'),
+    #     caption = paste('Top',tableLimit,'Players by Playtime'),
+    #     table.attr = "style='width:40%; margin: auto;'"
+    # )  %>%
+    # kableExtra::kable_styling(
+    #     full_width = F,
+    #     bootstrap_options = c("striped", "condensed"),
+    #     fixed_thead = T
+    # ) %>%
+    # fix_unicode()
+    
+    DT::datatable(
+        playtimes[,c('name', 'timeString')],
+        colnames = c('Name', 'Duration'),
+        class = 'compact stripe',
+        options = list(
+            pageLength = 25,
+            columnDefs = list(
+                list(
+                    targets = -1,
+                    className = 'dt-body-right',
+                    width = '15%'
+                )
+            )
+        )
+    )
+```
